@@ -1,4 +1,5 @@
 {-# LANGUAGE PatternSynonyms #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Kupo.Data.Hydra where
 
@@ -9,12 +10,27 @@ import Cardano.Crypto.Hash
     , hashToBytes
     , hashWith
     )
+import Cardano.Ledger.Allegra.Scripts (translateTimelock)
+import Cardano.Ledger.Alonzo.Scripts (AlonzoScript (..))
+import Cardano.Ledger.Alonzo.Tx(AlonzoTx)
+import Cardano.Ledger.Alonzo.TxWits (unTxDats)
+import Cardano.Ledger.Api (
+    outputsTxBodyL,
+    inputsTxBodyL,
+    datsTxWitsL,
+    scriptTxWitsL,
+    witsTxL,
+    bodyTxL
+    )
+import Cardano.Ledger.Babbage (AlonzoScript)
+import Cardano.Ledger.Binary (decodeFullAnnotator)
+import Cardano.Ledger.Block (txid)
+import Cardano.Ledger.Plutus.Data (translateDatum, dataToBinaryData, upgradeData)
 import Cardano.Ledger.SafeHash
     ( unsafeMakeSafeHash
     )
 import Data.Aeson
-    ( (.!=)
-    , (.:)
+    ( (.:)
     , (.:?)
     )
 import Kupo.Data.Cardano
@@ -57,7 +73,10 @@ import Kupo.Data.PartialBlock
     ( PartialBlock (..)
     , PartialTransaction (..)
     )
-
+import qualified Cardano.Binary as CBOR
+import qualified Cardano.Ledger.Api as LedgerApi
+import qualified Cardano.Ledger.Babbage.TxBody as Babbage
+import qualified Cardano.Ledger.Core as Ledger
 import qualified Codec.CBOR.Decoding as Cbor
 import qualified Codec.CBOR.Read as Cbor
 import qualified Data.Aeson.Key as Key
@@ -154,17 +173,33 @@ decodeGenesisTxForUTxO id indexOutputs = do
         , metadata = Nothing
         }
 
+instance CBOR.FromCBOR (AlonzoTx (BabbageEra StandardCrypto)) where
+  fromCBOR = do
+        bs <- CBOR.decodeBytes
+        decodeFullAnnotator ledgerEraVersion lbl decCBOR (fromStrict bs)
+            & either (fail . show) pure
+    where
+        lbl = "(AlonzoTx (BabbageEra StandardCrypto))"
+
+        ledgerEraVersion = Ledger.eraProtVerLow @(BabbageEra StandardCrypto)
+
 decodePartialTransaction :: Json.Value -> Json.Parser PartialTransaction
 decodePartialTransaction = Json.withObject "PartialTransaction" $ \o -> do
-    id <- o .: "id" >>= decodeTransactionId
+    hexText <- o .: "cborHex"
 
-    body <- o .: "body"
-    inputs <- body .: "inputs" >>= traverse decodeInput
-    outputs <- body .:? "outputs" .!= [] >>= traverse decodeOutput
+    bytes <- decodeBase16' hexText
 
-    wits <- o.: "witnesses"
-    datums <- wits .:? "datums" .!= Json.Object mempty >>= decodeDatums
-    scripts <- wits .:? "scripts" .!= Json.Object mempty >>= decodeScripts
+    tx <- case CBOR.decodeFull' @(AlonzoTx (BabbageEra StandardCrypto)) bytes of
+      Left e -> fail $ show e
+      Right tx -> pure tx
+
+    let body' = tx ^. bodyTxL
+    let inputs = toList (body' ^. inputsTxBodyL)
+    let outputs = map convertOutput $ toList (body' ^. outputsTxBodyL)
+    let wits' = tx ^. witsTxL
+    let scripts = Map.map convertScript (wits' ^. scriptTxWitsL)
+    let datums = Map.map convertData $ unTxDats (wits' ^. datsTxWitsL)
+    let id = txid body'
 
     -- TODO
     -- This is 'acceptable' for now because:
@@ -185,6 +220,18 @@ decodePartialTransaction = Json.withObject "PartialTransaction" $ \o -> do
         , scripts
         , metadata
         }
+    where
+        convertOutput :: Babbage.BabbageTxOut (BabbageEra StandardCrypto) -> Output
+        convertOutput (Babbage.BabbageTxOut addr val datum maybeScript) =
+            (Babbage.BabbageTxOut addr val (translateDatum datum) (convertScript <$> maybeScript))
+
+        convertData :: LedgerApi.Data (BabbageEra StandardCrypto) -> BinaryData
+        convertData = dataToBinaryData . upgradeData
+
+        convertScript :: AlonzoScript (BabbageEra StandardCrypto) -> Script
+        convertScript = \case
+            TimelockScript timelock -> TimelockScript (translateTimelock timelock)
+            PlutusScript script -> PlutusScript script
 
 decodeDatums :: Json.Value -> Json.Parser (Map DatumHash BinaryData)
 decodeDatums = Json.withObject "Datums" $
